@@ -9,49 +9,54 @@ import cloudinary.uploader
 import cloudinary.api
 from urllib.parse import quote
 from dotenv import load_dotenv
-from fastapi.middleware.cors import CORSMiddleware # Import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables from .env file (for local development)
+# Render will use its own environment variable system in production
 load_dotenv()
 
 # --- Cloudinary Configuration ---
+# For Render, these MUST be set in the Render dashboard's environment variables.
+# The fallback values here are for local convenience or if not set, but should not be relied upon for production.
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME") or "ddeazpmcd"
 CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY") or "193187914314353"
 CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET") or "g352-BZO2OGstejYakcniC-fbeQ"
 
 if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
-    print("ERROR: Cloudinary credentials are not fully set in environment variables.")
-    print("Please set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.")
+    print("WARNING: Cloudinary credentials are not fully set in environment variables.")
+    print("Please ensure CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET are set.")
+    # For Render, the app might still start, but Cloudinary functionality will fail.
+    # It's better to handle this more gracefully or ensure variables are always set in production.
 else:
-    cloudinary.config(
-        cloud_name=CLOUDINARY_CLOUD_NAME,
-        api_key=CLOUDINARY_API_KEY,
-        api_secret=CLOUDINARY_API_SECRET,
-        secure=True
-    )
-    print("Cloudinary configured successfully.")
-
+    try:
+        cloudinary.config(
+            cloud_name=CLOUDINARY_CLOUD_NAME,
+            api_key=CLOUDINARY_API_KEY,
+            api_secret=CLOUDINARY_API_SECRET,
+            secure=True
+        )
+        print("Cloudinary configured successfully.")
+    except Exception as e:
+        print(f"ERROR: Failed to configure Cloudinary: {e}")
+        # Depending on requirements, you might want to prevent the app from starting
+        # if Cloudinary config fails. For now, it will print an error.
 
 # Create a FastAPI application instance
 app = fastapi.FastAPI(
     title="Instagram Media Uploader to Cloudinary",
     description="Fetches media from an Instagram URL, uploads it to Cloudinary, and returns Cloudinary links. Accessible by anyone with network access.",
-    version="2.2.0", # Incremented version
+    version="2.2.1", # Incremented version for Render compatibility
 )
 
 # --- CORS Middleware Configuration ---
-# This allows requests from any origin.
-# For more restrictive CORS, specify origins in the allow_origins list.
-# e.g., allow_origins=["https://yourfrontend.com", "http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True, # Allows cookies to be included in requests
-    allow_methods=["*"],  # Allows all methods (GET, POST, PUT, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 # --- End CORS Middleware Configuration ---
-
 
 # The base URL of the external Instagram API
 EXTERNAL_API_BASE_URL = "https://api.yabes-desu.workers.dev/download/instagram/v2?url="
@@ -91,10 +96,10 @@ async def process_instagram_and_upload_to_cloudinary(
     Fetches media from an Instagram URL, uploads it to Cloudinary,
     and returns information about the uploaded Cloudinary assets.
     """
-    if not CLOUDINARY_CLOUD_NAME:
+    if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
         raise fastapi.HTTPException(
             status_code=fastapi.status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Cloudinary service is not configured on the server."
+            detail="Cloudinary service is not configured on the server. Please set environment variables."
         )
 
     if not instagram_url:
@@ -107,12 +112,9 @@ async def process_instagram_and_upload_to_cloudinary(
 
     yabes_data = {}
     try:
-        response = requests.get(external_api_full_url, timeout=30)
-        if response.status_code != 200:
-            raise fastapi.HTTPException(
-                status_code=fastapi.status.HTTP_502_BAD_GATEWAY,
-                detail=f"External API (yabes-desu) returned HTTP {response.status_code}: {response.text[:200]}"
-            )
+        # Increased timeout for potentially slower network conditions in deployment
+        response = requests.get(external_api_full_url, timeout=45)
+        response.raise_for_status() # Raises an HTTPError for bad responses (4XX or 5XX)
         yabes_data = response.json()
 
     except requests.exceptions.Timeout:
@@ -121,6 +123,12 @@ async def process_instagram_and_upload_to_cloudinary(
             status_code=fastapi.status.HTTP_504_GATEWAY_TIMEOUT,
             detail="The request to the external Instagram API (yabes-desu) timed out."
         )
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP error from yabes-desu API: {http_err}. Response: {response.text[:200] if response else 'No response object'}")
+        raise fastapi.HTTPException(
+            status_code=fastapi.status.HTTP_502_BAD_GATEWAY,
+            detail=f"External API (yabes-desu) returned HTTP {response.status_code if response else 'N/A'}: {response.text[:200] if response else 'No response content'}"
+        )
     except requests.exceptions.RequestException as req_err:
         print(f"An unexpected error occurred with the external request to yabes-desu: {req_err}")
         raise fastapi.HTTPException(
@@ -128,7 +136,7 @@ async def process_instagram_and_upload_to_cloudinary(
             detail=f"Error connecting to external Instagram API (yabes-desu): {req_err}"
         )
     except ValueError: 
-        print(f"Failed to decode JSON from yabes-desu API. Response text: {response.text[:200]}")
+        print(f"Failed to decode JSON from yabes-desu API. Response text: {response.text[:200] if response else 'No response object'}")
         raise fastapi.HTTPException(
             status_code=fastapi.status.HTTP_502_BAD_GATEWAY,
             detail="External Instagram API (yabes-desu) returned invalid JSON."
@@ -182,8 +190,9 @@ async def process_instagram_and_upload_to_cloudinary(
         try:
             upload_result = cloudinary.uploader.upload(
                 media_url,
-                resource_type="auto",
-                folder="instagram_imports"
+                resource_type="auto",  # Let Cloudinary auto-detect
+                folder="instagram_imports",
+                timeout=60 # Increased timeout for Cloudinary uploads
             )
             cloudinary_uploads.append({
                 "source_url": media_url,
@@ -201,7 +210,7 @@ async def process_instagram_and_upload_to_cloudinary(
                 "source_url": media_url,
                 "error": f"Cloudinary upload failed: {str(e)}"
             })
-        except Exception as e:
+        except Exception as e: # Catching broader exceptions during upload
             print(f"Unexpected error uploading {media_url} to Cloudinary: {e}")
             cloudinary_uploads.append({
                 "source_url": media_url,
@@ -217,16 +226,24 @@ async def process_instagram_and_upload_to_cloudinary(
         "original_yabes_desu_data_summary": {
              "caption": yabes_data_field.get("caption"),
              "username": yabes_data_field.get("username"),
-             "likes": yabes_data_field.get("like"),
-             "comments": yabes_data_field.get("comment"),
+             "likes": yabes_data_field.get("like"),      # Make sure 'like' key exists
+             "comments": yabes_data_field.get("comment"),# Make sure 'comment' key exists
              "is_video": yabes_data_field.get("isVideo")
         },
         "cloudinary_uploads": cloudinary_uploads
     }
 
 if __name__ == "__main__":
-    if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
-         print("\nWARNING: Cloudinary is not configured. Uploads will fail. Please check your .env file or environment variables.\n")
+    # Render sets the PORT environment variable.
+    # Fallback to 8000 for local development if PORT is not set.
+    port = int(os.environ.get("PORT", 8000))
     
-    # host="0.0.0.0" makes the server accessible from your network, not just localhost.
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # host="0.0.0.0" is important for Render to correctly map requests
+    # from its load balancer to your application.
+    
+    if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
+         print("\nCRITICAL WARNING: Cloudinary is not configured. Uploads WILL FAIL.")
+         print("Ensure CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET are set as environment variables.\n")
+    
+    print(f"Starting Uvicorn server on host 0.0.0.0 and port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
