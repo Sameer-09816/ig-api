@@ -1,0 +1,5 @@
+fastapi
+requests
+uvicorn[standard]
+python-dotenv
+cloudinary
